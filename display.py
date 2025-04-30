@@ -8,8 +8,8 @@ from datetime import date, timedelta
 
 # --- SentinelHub Config ---
 config = SHConfig()
-config.sh_client_id = secrets["sentinelhub"]["sh_client_id"]
-config.sh_client_secret = secrets["sentinelhub"]["sh_client_secret"]
+config.sh_client_id = e73b85fa-6087-4757-88ad-37b414c9050b
+config.sh_client_secret =gAVTpk83rD19EXDW1xxMzWB0QQSudsJV
 config.save()
 
 # --- City BBoxes ---
