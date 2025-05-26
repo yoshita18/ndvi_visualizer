@@ -1,10 +1,10 @@
-# import
-
-import streamlit as st
-from sentinelhub import SHConfig, BBox, CRS, SentinelHubRequest, DataCollection, MimeType
+import pandas as pd
 import numpy as np
+import streamlit as st
+from datetime import date, timedelta, datetime
 import matplotlib.pyplot as plt
-from datetime import date, timedelta
+from sentinelhub import SHConfig, BBox, CRS, SentinelHubRequest, DataCollection, MimeType
+from sklearn.ensemble import IsolationForest
 
 # --- SentinelHub Config ---
 config = SHConfig()
@@ -68,59 +68,44 @@ CITIES = {
 }
 
 
-# --- Evalscript for NDVI ---
-NDVI_EVALSCRIPT = """
+# --- Evalscript for NDVI, SAVI, and EVI ---
+EVALSCRIPT = """
 //VERSION=3
 function setup() {
   return {
-    input: ["B04", "B08", "dataMask"],
+    input: ["B04", "B08", "B02"],
     output: {
-      bands: 2,
+      bands: 3,
       sampleType: "FLOAT32"
     }
   };
 }
 
 function evaluatePixel(sample) {
+  // NDVI
   let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
-  return [ndvi, sample.dataMask];
+  
+  // SAVI
+  let savi = ((sample.B08 - sample.B04) / (sample.B08 + sample.B04 + 0.5)) * 1.5;
+
+  // EVI
+  let evi = 2.5 * (sample.B08 - sample.B04) / (sample.B08 + 6.0 * sample.B04 - 7.5 * sample.B02 + 10000);
+
+  return [ndvi, savi, evi];
 }
 """
 
-
-# --- Streamlit UI ---
-st.title("🌿 NDVI Visualizer")
-city = st.selectbox("Select a city", list(CITIES.keys()))
-min_date = date(2018, 1, 1)
-max_date = date.today()
-selected_date = st.date_input(
-    "Select a date",
-    value=date(2022, 1, 1),
-    min_value=date(2018, 1, 1),
-    max_value=date.today()
-)
-
-
-# --- Fetch NDVI for selected city & date ---
-if st.button("Generate NDVI Image"):
-    bbox = CITIES[city]
-    start_date = selected_date - timedelta(days=7)
-    end_date = selected_date + timedelta(days=7)
-    date_range = (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-
-    st.write(f"Fetching NDVI for **{city}** on **{selected_date}**...")
-
+# --- Function to fetch data ---
+def fetch_data_for_city(bbox, start_date, end_date):
+    date_range = (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
     request = SentinelHubRequest(
-        evalscript=NDVI_EVALSCRIPT,
-        input_data=[
-    SentinelHubRequest.input_data(
-        data_collection=DataCollection.SENTINEL2_L2A,
-        time_interval=date_range,
-        mosaicking_order='leastCC',
-        maxcc=0.2  # 20% cloud cover
-    )
-],
-
+        evalscript=EVALSCRIPT,
+        input_data=[SentinelHubRequest.input_data(
+            data_collection=DataCollection.SENTINEL2_L2A,
+            time_interval=date_range,
+            mosaicking_order='leastCC',  # Fetch least cloud cover images
+            maxcc=0.2  # 20% cloud coverage
+        )],
         responses=[SentinelHubRequest.output_response('default', MimeType.TIFF)],
         bbox=bbox,
         size=(512, 512),
@@ -128,22 +113,188 @@ if st.button("Generate NDVI Image"):
     )
 
     try:
-      
-        data = request.get_data()[0]
-        ndvi_image = data[:, :, 0]
-        mask = data[:, :, 1]
-
-        if np.all(mask == 0):
-            st.warning(f"It was too cloudy around **{selected_date}**, couldn't get the satellite image.")
-        else:
-            ndvi_image[mask == 0] = np.nan
-            normalized_ndvi = np.clip((ndvi_image + 1) / 2, 0, 1)  # Normalize NDVI from [-1, 1] to [0, 1]
-            fig, ax = plt.subplots(figsize=(6, 6))
-            im = ax.imshow(normalized_ndvi, cmap="YlGn", vmin=0, vmax=1)  # Show as 0 to 1
-            plt.colorbar(im, ax=ax, label="NDVI (Normalized)")
-
-            ax.axis("off")
-            st.pyplot(fig)
-
+        data = request.get_data()[0]  # Get the data for that time period
+        ndvi = data[:, :, 0]
+        savi = data[:, :, 1]
+        evi = data[:, :, 2]
+        return ndvi, savi, evi
     except Exception as e:
-        st.error(f"Failed to retrieve image: {e}")
+        print(f"Error fetching data: {e}")
+        return None, None, None
+
+# --- Time Series Analysis and Anomaly Detection ---
+def detect_anomalies(data, contamination=0.05):
+    model = IsolationForest(contamination=contamination)
+    anomalies = model.fit_predict(data)
+    return anomalies
+
+# --- Streamlit UI ---
+st.title("🌾 Crop Disease Monitoring using NDVI")
+
+# Add options to choose between visualizing NDVI, SAVI, EVI or anomaly detection
+option = st.radio("Select an option", ["Visualize NDVI", "Detect Anomalies"])
+
+# Select city and date range
+# city = st.selectbox("Select a city", list(CITIES.keys()))
+
+if option == "Visualize NDVI":
+    city = st.selectbox("Select a city", list(CITIES.keys()), key="city_selectbox")
+    
+    # Min and Max date setup
+    min_date = date(2018, 1, 1)
+    max_date = date.today()
+    
+    # Add a unique key to the date_input as well
+    selected_date = st.date_input(
+        "Select a date",
+        value=date(2022, 1, 1),
+        min_value=date(2018, 1, 1),
+        max_value=date.today(),
+        key="date_input"
+    )
+    
+    # Get the bounding box for the selected city
+    bbox = CITIES[city]
+    
+    # Function to fetch data and check if it is valid (not all zero mask)
+    def fetch_valid_data(bbox, selected_date):
+        for delta in range(-7, 8):  # Trying ±7 days
+            current_date = selected_date + timedelta(days=delta)
+            start_date = current_date - timedelta(days=7)
+            end_date = current_date + timedelta(days=7)
+            date_range = (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+
+            # Request to fetch data from SentinelHub
+            request = SentinelHubRequest(
+                evalscript=EVALSCRIPT,
+                input_data=[SentinelHubRequest.input_data(
+                    data_collection=DataCollection.SENTINEL2_L2A,
+                    time_interval=date_range,
+                    mosaicking_order='leastCC',
+                    maxcc=0.2  # 20% cloud cover
+                )],
+                responses=[SentinelHubRequest.output_response('default', MimeType.TIFF)],
+                bbox=bbox,
+                size=(512, 512),
+                config=config
+            )
+
+            try:
+                # Fetch the data
+                data = request.get_data()[0]
+                ndvi_image = data[:, :, 0]
+                mask = data[:, :, 1]
+
+                if np.all(mask == 0):  # If all elements in mask are zero
+                    continue  # Try the next date if all elements are zero
+                else:
+                    # Normalize the NDVI values and plot the image
+                    ndvi_image[mask == 0] = np.nan
+                    normalized_ndvi = np.clip((ndvi_image + 1) / 2, 0, 1)  # Normalize NDVI from [-1, 1] to [0, 1]
+                    return normalized_ndvi, current_date  # Return the valid data and corresponding date
+
+            except Exception as e:
+                continue  # If data fetching failed, try the next date
+
+        # If no valid data was found after ±7 days, return None
+        return None, None
+
+    # Fetch data for selected city and date
+    normalized_ndvi, valid_date = fetch_valid_data(bbox, selected_date)
+    
+    if normalized_ndvi is not None:
+        # Plot the valid NDVI data
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(normalized_ndvi, cmap="YlGn", vmin=0, vmax=1)  # Show as 0 to 1
+        plt.colorbar(im, ax=ax, label="NDVI (Normalized)")
+
+        ax.axis("off")
+        st.write(f"Fetched NDVI for **{city}** on **{valid_date}**.")
+        st.pyplot(fig)
+
+    else:
+        st.warning(f"It was too cloudy around **{selected_date}** and the surrounding dates. Couldn't get the satellite image.")
+
+
+
+elif option == "Detect Anomalies":
+    biweekly_ndvi_dataset = pd.read_csv('biweekly_ndvi_dataset.csv')
+
+    # Ensure the 'Start Date' column is in datetime format
+    biweekly_ndvi_dataset['Start Date'] = pd.to_datetime(biweekly_ndvi_dataset['Start Date'])
+
+    # Set 'Start Date' as the index
+    biweekly_ndvi_dataset.set_index('Start Date', inplace=True)
+
+    # st.title("🌾 Crop Disease Monitoring using NDVI, SAVI, and EVI")
+
+    # --- City Selection ---
+    city = st.selectbox("Select a city", list(biweekly_ndvi_dataset['City'].unique()))
+    
+    min_date = date(2018, 1, 1)  # The earliest date that can be selected
+    max_date = date.today()  # The latest date that can be selected
+
+    # Start Date with restriction
+    start_date = st.date_input(
+        "Start Date",
+        value=min_date,
+        min_value=min_date,  # Ensure start date cannot be before 2018-01-01
+        max_value=max_date  # Ensure start date cannot be after today's date
+    )
+
+    # End Date with restriction
+    end_date = st.date_input(
+        "End Date",
+        value=max_date,
+        min_value=start_date,  # Ensure that the end date cannot be before the start date
+        max_value=max_date  # Ensure end date cannot be after today's date
+    )
+    
+    if (end_date - start_date).days < 365:
+        st.write("**Tip:** To get a clear view of anomalies, make sure the range of dates is at least a year.")
+
+    # Filter the dataset based on the selected city and date range
+    city_data = biweekly_ndvi_dataset[(biweekly_ndvi_dataset['City'] == city) & 
+                                    (biweekly_ndvi_dataset.index >= pd.to_datetime(start_date)) & 
+                                    (biweekly_ndvi_dataset.index <= pd.to_datetime(end_date))]
+
+    # --- Time Series Analysis and Anomaly Detection ---
+    if city_data.empty:
+        st.write(f"No data available for **{city}** in the selected date range.")
+    else:
+        # Prepare data for anomaly detection (only the 'NDVI' column for now)
+        data = city_data[['NDVI']]
+
+        # Detect anomalies
+        anomalies = detect_anomalies(data[['NDVI']].values)
+
+        # Add anomalies to the DataFrame
+        city_data['anomaly'] = anomalies
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot NDVI with anomalies highlighted
+        ax.plot(city_data.index, city_data['NDVI'], label='NDVI', color='blue')
+        ax.scatter(city_data.index[city_data['anomaly'] == -1], city_data['NDVI'][city_data['anomaly'] == -1], 
+                color='red', label='Anomalies', zorder=5)
+
+        # Adding title, labels, legend, and grid
+        ax.set_title(f'{city} NDVI Time Series with Anomalies Detected')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('NDVI')
+        ax.legend()
+        ax.grid(True)
+
+        # Display the plot
+        st.pyplot(fig)
+
+        # Show the anomalies in a table
+        st.write("Anomalies Detected:")
+        st.dataframe(city_data[city_data['anomaly'] == -1])
+
+        # Alert system if anomalies are detected
+        if np.any(anomalies == -1):
+            st.warning(f"Alert: Crop disease detected! Anomalies have been detected in {city}'s crop health indicators.")
+        else:
+            st.success(f"No anomalies detected for {city}.")
+        
